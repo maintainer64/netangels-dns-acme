@@ -102,7 +102,7 @@ _acmeproxy_request() {
         _info "Successfully created TXT record id=$rid"
         # Save record id per (name, value)
         key="$(_na_record_key "$name" "$txtvalue")"
-        _saveaccountconf_mutable "$key" "$rid"
+        _na_state_put "$key" "$rid"
         return 0
       fi
 
@@ -119,13 +119,13 @@ _acmeproxy_request() {
     cleanup)
       # Try to read saved record id first
       key="$(_na_record_key "$name" "$txtvalue")"
-      rid="$(_readaccountconf_mutable "$key")"
+      rid="$(_na_state_get "$key")"
 
       if [ -n "$rid" ]; then
         _debug "Found saved record id: $rid, deleting..."
         if _na_delete_record_by_id "$token" "$rid"; then
           _info "Deleted TXT record id=$rid"
-          _clearaccountconf_mutable "$key"
+          _na_state_del "$key"
           return 0
         else
           _err "Failed to delete TXT record id=$rid (will try to find by listing)"
@@ -166,6 +166,46 @@ _acmeproxy_request() {
 }
 
 ####################  Private functions below ##################################
+
+# --- Transient state (store record IDs in a tmp file) ---
+
+_na_state_file() {
+  # старайся класть рядом с рабочей директорией acme.sh, иначе /tmp
+  if [ -n "$LE_WORKING_DIR" ] && [ -d "$LE_WORKING_DIR" ]; then
+    printf "%s/.na_acmeproxy_state" "$LE_WORKING_DIR"
+  else
+    printf "/tmp/.na_acmeproxy_state"
+  fi
+}
+
+_na_state_put() {
+  key="$1"
+  val="$2"
+  f="$(_na_state_file)"
+  # гарантируем существование файла
+  : > "$f" 2>/dev/null || return 0
+  # удалим старое значение ключа, если есть
+  if [ -f "$f" ]; then
+    grep -v "^$key=" "$f" 2>/dev/null > "$f.tmp" || :
+    mv "$f.tmp" "$f" 2>/dev/null || :
+  fi
+  printf "%s=%s\n" "$key" "$val" >> "$f"
+}
+
+_na_state_get() {
+  key="$1"
+  f="$(_na_state_file)"
+  [ -r "$f" ] || return 1
+  sed -n "s/^$key=//p" "$f" | head -n1
+}
+
+_na_state_del() {
+  key="$1"
+  f="$(_na_state_file)"
+  [ -w "$f" ] || return 0
+  grep -v "^$key=" "$f" 2>/dev/null > "$f.tmp" || :
+  mv "$f.tmp" "$f" 2>/dev/null || :
+}
 
 _na_get_token() {
   # Input: API key
