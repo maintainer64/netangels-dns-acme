@@ -96,24 +96,19 @@ _acmeproxy_request() {
       response="$(_post "$data" "$_NA_RECORDS_ENDPOINT/" "" "POST")"
       _debug response "$response"
 
-      # Extract created ID
+      # Extract created record ID (field "id", not "zone_id")
       rid="$(_na_extract_id "$response")"
       if [ -n "$rid" ]; then
         _info "Successfully created TXT record id=$rid"
-        # Save record id per (name, value)
+        # Save record id per (name, value) for fast cleanup
         key="$(_na_record_key "$name" "$txtvalue")"
         _na_state_put "$key" "$rid"
         return 0
       fi
 
-      if echo "$response" | grep -F "\"$txtvalue\"" >/dev/null 2>&1; then
-        _info "Successfully created the TXT record"
-        return 0
-      else
-        _err "Error creating TXT record"
-        _err "$response"
-        return 1
-      fi
+      _err "Error creating TXT record"
+      _err "$response"
+      return 1
       ;;
 
     cleanup)
@@ -170,7 +165,6 @@ _acmeproxy_request() {
 # --- Transient state (store record IDs in a tmp file) ---
 
 _na_state_file() {
-  # старайся класть рядом с рабочей директорией acme.sh, иначе /tmp
   if [ -n "$LE_WORKING_DIR" ] && [ -d "$LE_WORKING_DIR" ]; then
     printf "%s/.na_acmeproxy_state" "$LE_WORKING_DIR"
   else
@@ -182,13 +176,11 @@ _na_state_put() {
   key="$1"
   val="$2"
   f="$(_na_state_file)"
-  # гарантируем существование файла
-  : > "$f" 2>/dev/null || return 0
-  # удалим старое значение ключа, если есть
-  if [ -f "$f" ]; then
-    grep -v "^$key=" "$f" 2>/dev/null > "$f.tmp" || :
-    mv "$f.tmp" "$f" 2>/dev/null || :
-  fi
+  # Ensure file exists
+  touch "$f" 2>/dev/null || return 0
+  # Remove old value for key if present
+  grep -v "^${key}=" "$f" 2>/dev/null > "$f.tmp" || :
+  mv "$f.tmp" "$f" 2>/dev/null || :
   printf "%s=%s\n" "$key" "$val" >> "$f"
 }
 
@@ -196,19 +188,19 @@ _na_state_get() {
   key="$1"
   f="$(_na_state_file)"
   [ -r "$f" ] || return 1
-  sed -n "s/^$key=//p" "$f" | head -n1
+  sed -n "s/^${key}=//p" "$f" | head -n1
 }
 
 _na_state_del() {
   key="$1"
   f="$(_na_state_file)"
   [ -w "$f" ] || return 0
-  grep -v "^$key=" "$f" 2>/dev/null > "$f.tmp" || :
+  grep -v "^${key}=" "$f" 2>/dev/null > "$f.tmp" || :
   mv "$f.tmp" "$f" 2>/dev/null || :
 }
 
+# Obtain a Bearer token from the NetAngels gateway using an API key.
 _na_get_token() {
-  # Input: API key
   api_key="$1"
   export _H1="Content-Type: application/x-www-form-urlencoded"
   export _H2="Accept: application/json"
@@ -226,6 +218,7 @@ _na_get_token() {
     return 1
   fi
 
+  # Prepend "Bearer " if not already present
   case "$token" in
     [Bb][Ee][Aa][Rr][Ee][Rr]\ *) : ;;
     *) token="Bearer $token" ;;
@@ -234,15 +227,25 @@ _na_get_token() {
   printf "%s" "$token"
 }
 
+# Extract the record "id" (integer) from a JSON response produced by the
+# records create endpoint.  The response looks like:
+#   {"id":123,"zone_id":456,"name":"...","type":"TXT","details":{"value":"..."}}
+# We must return the value of "id", NOT "zone_id".
 _na_extract_id() {
-  # Extract first numeric id from JSON
-  # Output: id or empty
-  printf "%s" "$1" | _egrep_o '"id"[[:space:]]*:[[:space:]]*[0-9]+' \
-    | sed -E 's/.*: *([0-9]+).*/\1/' | head -n1
+  # Strategy: find the very first occurrence of  "id": <number>  in the
+  # response.  NetAngels always puts "id" before "zone_id", so head -n1 is
+  # safe here.  We additionally anchor the key name so that "zone_id" can
+  # never match (it does not start with a plain quote-id-quote pattern that
+  # we look for).
+  printf "%s" "$1" \
+    | _egrep_o '"id"[[:space:]]*:[[:space:]]*[0-9]+' \
+    | sed -E 's/[^0-9]*([0-9]+).*/\1/' \
+    | head -n1
 }
 
+# Build a stable key string used to persist a record ID between the add and
+# remove phases.
 _na_record_key() {
-  # Create a stable account-conf key for record id, based on name+value
   name="$1"
   val="$2"
   sname="$(printf "%s" "$name" | sed 's/[^A-Za-z0-9_]/_/g')"
@@ -250,8 +253,8 @@ _na_record_key() {
   printf "ACMEPROXY_ID_%s_%s" "$sname" "$vhash"
 }
 
+# Delete a single DNS record by its numeric ID.
 _na_delete_record_by_id() {
-  # Args: token id
   token="$1"
   rid="$2"
 
@@ -261,12 +264,11 @@ _na_delete_record_by_id() {
   resp="$(_post "" "$_NA_RECORDS_ENDPOINT/$rid/" "" "DELETE")"
   _debug "delete_resp" "$resp"
 
-  # If response contains the same id or is empty-success, consider ok
+  # Success: response contains the deleted record id, or body is empty / has no error keyword
   if printf "%s" "$resp" | grep -E "\"id\"[[:space:]]*:[[:space:]]*$rid" >/dev/null 2>&1; then
     return 0
   fi
 
-  # Some APIs may return empty body on 200; try to detect via presence of error keywords
   if [ -z "$resp" ] || ! printf "%s" "$resp" | grep -qi "error"; then
     return 0
   fi
@@ -274,8 +276,10 @@ _na_delete_record_by_id() {
   return 1
 }
 
+# List all TXT records in a zone and return the IDs of those that match both
+# the given name and the given value (details.value).
+# Handles pagination automatically (limit=100 per page).
 _na_find_record_ids() {
-  # Args: token zone_id name value
   token="$1"
   zone_id="$2"
   name="$3"
@@ -284,34 +288,92 @@ _na_find_record_ids() {
   export _H1="Authorization: $token"
   export _H2="Accept: application/json"
 
-  url="$_NA_ZONES_ENDPOINT/$zone_id/records/"
-  resp="$(_get "$url")"
-  _debug "list_resp" "$resp"
+  offset=0
+  limit=100
 
-  # Make it easier to scan entity-by-entity
-  entities="$(printf "%s" "$resp" | tr -d '\n' | sed 's/},{/}\n{/g')"
+  while true; do
+    url="$_NA_ZONES_ENDPOINT/$zone_id/records/?offset=$offset&limit=$limit"
+    resp="$(_get "$url")"
+    _debug "list_resp (offset=$offset)" "$resp"
 
-  printf "%s\n" "$entities" | while IFS= read -r obj; do
-    # Expect name, type TXT and details.value matches
-    echo "$obj" | grep -q '"type"[[:space:]]*:[[:space:]]*"TXT"' || continue
-    echo "$obj" | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$name\"" || continue
+    # Total number of records reported by the API
+    count="$(printf "%s" "$resp" \
+      | _egrep_o '"count"[[:space:]]*:[[:space:]]*[0-9]+' \
+      | sed -E 's/[^0-9]*([0-9]+).*/\1/' \
+      | head -n1)"
+    _debug "total count=$count"
 
-    # Match value inside details; accept both "details":{"value":"..."} or any spacing
-    echo "$obj" | tr -d '\n' | grep -q "\"value\"[[:space:]]*:[[:space:]]*\"$(_escape_regex "$value")\"" || continue
+    # Pull out the raw content of the "entities" JSON array, then split it
+    # into individual top-level objects using awk (correctly handles the
+    # nested "details":{...} sub-object).
+    entities_raw="$(printf "%s" "$resp" | tr -d '\r\n' \
+      | sed -E 's/.*"entities"[[:space:]]*:[[:space:]]*\[//' \
+      | sed -E 's/\][[:space:]]*\}[[:space:]]*$//')"
 
-    rid="$(printf "%s" "$obj" | _egrep_o '"id"[[:space:]]*:[[:space:]]*[0-9]+' | sed -E 's/.*: *([0-9]+).*/\1/' | head -n1)"
-    [ -n "$rid" ] && printf "%s\n" "$rid"
+    printf "%s" "$entities_raw" | awk '
+      BEGIN { depth = 0; obj = "" }
+      {
+        n = split($0, chars, "")
+        for (i = 1; i <= n; i++) {
+          c = chars[i]
+          obj = obj c
+          if (c == "{") {
+            depth++
+          } else if (c == "}") {
+            depth--
+            if (depth == 0) {
+              print obj
+              obj = ""
+            }
+          }
+        }
+      }
+    ' | while IFS= read -r entity; do
+      _debug2 "entity" "$entity"
+
+      # Must be a TXT record
+      printf "%s" "$entity" \
+        | grep -q '"type"[[:space:]]*:[[:space:]]*"TXT"' || continue
+
+      # Name must match exactly
+      printf "%s" "$entity" \
+        | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$(_escape_regex "$name")\"" || continue
+
+      # Extract the "details" object and check its "value" field.
+      # This avoids false positives from other string fields in the record.
+      details="$(printf "%s" "$entity" \
+        | sed -E 's/.*"details"[[:space:]]*:[[:space:]]*\{([^}]*)\}.*/\1/')"
+      _debug2 "details" "$details"
+
+      printf "%s" "$details" \
+        | grep -q "\"value\"[[:space:]]*:[[:space:]]*\"$(_escape_regex "$value")\"" || continue
+
+      # Extract the record "id" (the first "id" field; "zone_id" won't match
+      # the bare "id" pattern because of the leading zone_ characters).
+      rid="$(printf "%s" "$entity" \
+        | _egrep_o '"id"[[:space:]]*:[[:space:]]*[0-9]+' \
+        | sed -E 's/[^0-9]*([0-9]+).*/\1/' \
+        | head -n1)"
+
+      [ -n "$rid" ] && printf "%s\n" "$rid"
+    done
+
+    # Stop when we have fetched all records
+    if [ -z "$count" ] || [ "$((offset + limit))" -ge "$count" ]; then
+      break
+    fi
+    offset=$((offset + limit))
   done
 }
 
+# Escape special regex characters so a literal string can be used in grep -E.
 _escape_regex() {
-  # Escape for basic grep -E usage
   printf "%s" "$1" | sed -e 's/[][\.^$*/]/\\&/g'
 }
 
-# acme.sh provides _json_encode, but define fallback if needed
+# Minimal JSON string encoder (handles backslash and double-quote escaping).
+# acme.sh provides its own _json_encode; this is a fallback.
 _json_encode() {
-  # Very small JSON string escaper for acme.sh context
   s="$1"
   s="$(printf "%s" "$s" | sed 's/\\/\\\\/g; s/"/\\"/g')"
   printf "\"%s\"" "$s"
